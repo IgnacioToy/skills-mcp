@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2034  # variables consumed by lib/common.sh
+# sfclaude — launch Claude Code on SiliconFlow's Anthropic-compatible API.
+#
+# SiliconFlow (硅基流动) is a multi-model platform giving access to DeepSeek,
+# Kimi, GLM, MiniMax, Qwen, Yi, and more through one API key.
+#
+# Endpoint: https://api.siliconflow.cn/  (Anthropic-compatible)
+# Model catalog: https://cloud.siliconflow.cn/models
+#
+# Note: SiliconFlow model names use the "provider/Model-Name" convention
+# (e.g. deepseek-ai/DeepSeek-V4-PRO, moonshotai/Kimi-K2-Instruct-0905).
+#
+# Reads SF_API_KEY from the environment first, then falls back to
+# ~/.zshrc / ~/.bashrc / ~/.bash_profile / ~/.profile if not already exported.
+#
+# Quick start (no install needed):
+#   chmod +x sfclaude
+#   ./sfclaude
+#
+# Use:
+#   sfclaude                  # deepseek-ai/DeepSeek-V4-PRO (default)
+#   sfclaude fast             # deepseek-ai/DeepSeek-V3 (cheaper)
+#   sfclaude kimi             # moonshotai/Kimi-K2-Instruct-0905
+#   sfclaude glm              # Pro/zai-org/GLM-5
+#   sfclaude minimax          # Pro/MiniMaxAI/MiniMax-M2.5
+#   sfclaude qwen             # Qwen/Qwen2.5-Coder
+#   sfclaude yi               # 01-ai/Yi-1.5
+#   sfclaude r1               # deepseek-ai/DeepSeek-R1 (deep reasoning)
+#   sfclaude long             # request max context window
+#   sfclaude effort max       # set reasoning effort (low|medium|high|xhigh|max)
+#   sfclaude update           # git pull latest from this repo
+#   sfclaude --help           # any remaining flag is forwarded to claude
+#
+# Optional env overrides:
+#   SF_MODEL=deepseek-ai/DeepSeek-V4-PRO       # main model (any SF model)
+#   SF_FLASH_MODEL=deepseek-ai/DeepSeek-V3     # flash / haiku / subagent tier
+#   SF_BASE_URL=https://api.siliconflow.cn/    # custom Anthropic-compatible URL
+#   SF_CTX=1048576                             # max context tokens
+#   SF_OUTPUT=8000                             # cap output tokens
+#   SF_EFFORT=max                              # CLAUDE_CODE_EFFORT_LEVEL
+#
+# Get your API key: https://cloud.siliconflow.cn/account/ak
+
+set -euo pipefail
+
+# Resolve symlink to find the real script directory.
+_SELF="$0"
+if [ -L "$_SELF" ]; then
+  _LINK="$(readlink "$_SELF")"
+  case "$_LINK" in
+    /*) _SELF="$_LINK" ;;
+    *)  _SELF="$(cd "$(dirname "$_SELF")" && pwd)/$_LINK" ;;
+  esac
+fi
+SELF_DIR="$(cd "$(dirname "$_SELF")" && pwd)"
+if [ -f "$SELF_DIR/lib/common.sh" ]; then source "$SELF_DIR/lib/common.sh"
+elif [ -f "$SELF_DIR/../lib/common.sh" ]; then source "$SELF_DIR/../lib/common.sh"
+else echo "sfclaude: cannot find lib/common.sh. Reinstall or cd to repo." >&2; exit 1; fi
+
+check_version "sfclaude" "$@"
+
+PRO_MODEL="${SF_MODEL:-deepseek-ai/DeepSeek-V4-PRO}"
+FLASH_MODEL="${SF_FLASH_MODEL:-deepseek-ai/DeepSeek-V3}"
+
+if [ $# -gt 0 ] && [ "$1" = "update" ]; then
+  do_update "sfclaude" "SFCLAUDE_HOME"
+fi
+
+API_KEY="$(resolve_api_key "SF_API_KEY")"
+if [ -z "$API_KEY" ]; then
+  echo "❌ SF_API_KEY not found." >&2
+  echo "   Add to ~/.zshrc or ~/.bashrc:  export SF_API_KEY=sk-xxxxxxxxxxxxxxxxxx" >&2
+  echo "   Get your key at: https://cloud.siliconflow.cn/account/ak" >&2
+  exit 1
+fi
+
+BASE_URL="${SF_BASE_URL:-https://api.siliconflow.cn/}"
+
+LONG_CTX=0
+EFFORT="${SF_EFFORT:-}"
+
+MAIN_MODEL=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    max|pro)         MAIN_MODEL="$PRO_MODEL"; shift ;;
+    fast|flash|lite) MAIN_MODEL="$FLASH_MODEL"; shift ;;
+    kimi)            MAIN_MODEL="moonshotai/Kimi-K2-Instruct-0905"; shift ;;
+    glm)             MAIN_MODEL="Pro/zai-org/GLM-5"; shift ;;
+    minimax)         MAIN_MODEL="Pro/MiniMaxAI/MiniMax-M2.5"; shift ;;
+    qwen)            MAIN_MODEL="Qwen/Qwen2.5-Coder"; shift ;;
+    yi)              MAIN_MODEL="01-ai/Yi-1.5"; shift ;;
+    r1)              MAIN_MODEL="deepseek-ai/DeepSeek-R1"; shift ;;
+    long)            LONG_CTX=1; shift ;;
+    effort)
+      case "${2:-}" in
+        low|medium|high|xhigh|max) EFFORT="$2"; shift 2 ;;
+        *) echo "sfclaude: invalid effort level '${2:-}'. Use: low medium high xhigh max" >&2; exit 1 ;;
+      esac ;;
+    --) shift; break ;;
+    *)  break ;;
+  esac
+done
+
+if [ -z "$MAIN_MODEL" ]; then MAIN_MODEL="$PRO_MODEL"; fi
+
+case "$MAIN_MODEL" in
+  "$PRO_MODEL")       OTHER_MODEL="$FLASH_MODEL"; OTHER_DESC="DeepSeek V3 — fast / cheap tier" ;;
+  "$FLASH_MODEL")     OTHER_MODEL="$PRO_MODEL";   OTHER_DESC="DeepSeek V4 PRO — full reasoning" ;;
+  "deepseek-ai/DeepSeek-R1") OTHER_MODEL="$PRO_MODEL"; OTHER_DESC="DeepSeek V4 PRO" ;;
+  *)                  OTHER_MODEL="$PRO_MODEL";   OTHER_DESC="DeepSeek V4 PRO — full reasoning" ;;
+esac
+
+export_anthropic_base
+export CLAUDE_CODE_SUBAGENT_MODEL="$FLASH_MODEL"
+set_custom_model "$OTHER_MODEL" "$MAIN_MODEL" "$OTHER_DESC"
+
+CTX="${SF_CTX:-}"
+OUTPUT_CAP="${SF_OUTPUT:-}"
+apply_context_and_effort
+
+show_banner_and_launch "SiliconFlow" "$@"

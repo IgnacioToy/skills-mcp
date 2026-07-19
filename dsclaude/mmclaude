@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2034  # variables consumed by lib/common.sh
+# mmclaude — launch Claude Code on Xiaomi MiMo's Anthropic-compatible API.
+#
+# Follows the official MiMo "Claude Code 配置" guide:
+#   - Pay-as-you-go : https://api.xiaomimimo.com/anthropic            (sk-... keys)
+#   - Token Plan    : https://token-plan-cn.xiaomimimo.com/anthropic  (tp-... keys)
+#     (Token Plan subscribers may receive a custom subdomain — override
+#      the base URL via MIMO_BASE_URL.)
+#
+# Reads MIMO_API_KEY from the environment first, then falls back to
+# ~/.zshrc / ~/.bashrc / ~/.bash_profile / ~/.profile if not already exported.
+#
+# Quick start (no install needed):
+#   chmod +x mmclaude
+#   ./mmclaude
+#
+# Optional — make it globally available:
+#   sudo mv mmclaude /usr/local/bin/ && sudo chmod +x /usr/local/bin/mmclaude
+#
+# Use:
+#   mmclaude                  # start on mimo-v2.5-pro (MiMo default)
+#   mmclaude fast             # start on mimo-v2.5 (cheaper / faster flash tier)
+#   mmclaude long             # request max context window
+#   mmclaude effort max       # set reasoning effort (low|medium|high|xhigh|max)
+#   mmclaude update           # git pull latest from this repo
+#   mmclaude --help           # any remaining flag is forwarded to claude
+#
+# Optional env overrides:
+#   MIMO_MODEL=mimo-v2.5-pro                 # main model
+#   MIMO_FLASH_MODEL=mimo-v2.5               # flash / haiku / subagent tier
+#   MIMO_BASE_URL=https://.../anthropic      # custom Anthropic-compatible base URL
+#   MIMO_CTX=1048576                         # max context tokens (defaults to 1M with `long`)
+#   MIMO_OUTPUT=8000                         # cap output tokens
+#   MIMO_EFFORT=max                          # CLAUDE_CODE_EFFORT_LEVEL
+#
+# In-session switch:
+#   /model mimo-v2.5        # switch to the flash tier
+#   /model mimo-v2.5-pro    # switch back to pro
+#
+set -euo pipefail
+
+# Resolve symlink to find the real script directory.
+_SELF="$0"
+if [ -L "$_SELF" ]; then
+  _LINK="$(readlink "$_SELF")"
+  case "$_LINK" in
+    /*) _SELF="$_LINK" ;;
+    *)  _SELF="$(cd "$(dirname "$_SELF")" && pwd)/$_LINK" ;;
+  esac
+fi
+SELF_DIR="$(cd "$(dirname "$_SELF")" && pwd)"
+if [ -f "$SELF_DIR/lib/common.sh" ]; then source "$SELF_DIR/lib/common.sh"
+elif [ -f "$SELF_DIR/../lib/common.sh" ]; then source "$SELF_DIR/../lib/common.sh"
+else echo "mmclaude: cannot find lib/common.sh. Reinstall or cd to repo." >&2; exit 1; fi
+
+check_version "mmclaude" "$@"
+
+PRO_MODEL="${MIMO_MODEL:-mimo-v2.5-pro}"
+FLASH_MODEL="${MIMO_FLASH_MODEL:-mimo-v2.5}"
+
+# Handle the update subcommand before the API-key check so it works key-less.
+if [ $# -gt 0 ] && [ "$1" = "update" ]; then
+  do_update "mmclaude" "MMCLAUDE_HOME"
+fi
+
+API_KEY="$(resolve_api_key "MIMO_API_KEY")"
+if [ -z "$API_KEY" ]; then
+  echo "❌ MIMO_API_KEY not found." >&2
+  echo "   Add one line to ~/.zshrc or ~/.bashrc:" >&2
+  echo "     export MIMO_API_KEY=sk-xxxxxxxxxxxxxxxxxx   # pay-as-you-go" >&2
+  echo "     export MIMO_API_KEY=tp-xxxxxxxxxxxxxxxxxx   # Token Plan" >&2
+  exit 1
+fi
+
+# Auto-detect the base URL from the key prefix; MIMO_BASE_URL env always wins.
+BASE_URL="${MIMO_BASE_URL:-}"
+if [ -z "$BASE_URL" ]; then
+  case "$API_KEY" in
+    tp-*) BASE_URL="https://token-plan-cn.xiaomimimo.com/anthropic" ;;
+    *)    BASE_URL="https://api.xiaomimimo.com/anthropic" ;;
+  esac
+fi
+
+LONG_CTX=0
+EFFORT="${MIMO_EFFORT:-}"
+
+# Positional alias: `fast`/`flash` runs the flash tier as the main model.
+MAIN_MODEL="$PRO_MODEL"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    fast|flash) MAIN_MODEL="$FLASH_MODEL"; shift ;;
+    long) LONG_CTX=1; shift ;;
+    effort)
+      case "${2:-}" in
+        low|medium|high|xhigh|max) EFFORT="$2"; shift 2 ;;
+        *) echo "mmclaude: invalid effort level '${2:-}'. Use: low medium high xhigh max" >&2; exit 1 ;;
+      esac
+      ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+
+# Surface the other model in Claude Code's /model picker for mid-session switching.
+if [ "$MAIN_MODEL" = "$PRO_MODEL" ]; then
+  OTHER_MODEL="$FLASH_MODEL"
+  OTHER_DESC="MiMo v2.5 — fast / cheap haiku tier"
+else
+  OTHER_MODEL="$PRO_MODEL"
+  OTHER_DESC="MiMo v2.5 Pro — full reasoning"
+fi
+
+export_anthropic_base
+# Subagents run on the cheaper flash tier.
+export CLAUDE_CODE_SUBAGENT_MODEL="$FLASH_MODEL"
+set_custom_model "$OTHER_MODEL" "$MAIN_MODEL" "$OTHER_DESC"
+
+CTX="${MIMO_CTX:-}"
+OUTPUT_CAP="${MIMO_OUTPUT:-}"
+apply_context_and_effort
+
+show_banner_and_launch "MiMo" "$@"

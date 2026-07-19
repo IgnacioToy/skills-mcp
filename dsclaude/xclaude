@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2034  # variables consumed by lib/common.sh
+# xclaude — auto-detect your API key and launch the right backend for Claude Code.
+#
+# Checks env vars and shell rc files for a known API key, then delegates to the
+# matching launcher. No need to remember which script name maps to which provider.
+#
+# Supported providers (checked in order):
+#   DEEPSEEK_API_KEY     → dsclaude     (DeepSeek)
+#   MIMO_API_KEY         → mmclaude     (Xiaomi MiMo)
+#   DASHSCOPE_API_KEY    → qwclaude     (Bailian Qwen, pay-as-you-go)
+#   DASHSCOPE_CP_API_KEY → qwclaude     (Bailian Qwen, Coding Plan)
+#   DASHSCOPE_TP_API_KEY → qwclaude     (Bailian Qwen, Token Plan)
+#   GLM_API_KEY          → glmclaude    (ZhipuAI GLM)
+#   KIMI_API_KEY         → kmclaude    (Moonshot Kimi)
+#   ARK_API_KEY          → arkclaude    (Volcengine Ark)
+#   LONGCAT_API_KEY      → lcclaude    (Meituan LongCat)
+#   MINIMAX_API_KEY      → mxclaude    (MiniMax)
+#   HY_API_KEY           → hyclaude    (Tencent TokenHub)
+#   SF_API_KEY           → sfclaude    (SiliconFlow)
+#
+# Quick start:
+#   chmod +x xclaude && ./xclaude
+#
+# All args are forwarded to the underlying launcher, so everything works:
+#   xclaude fast long effort max    # fast model, 1M context, max effort
+#   xclaude kimi                    # on TokenHub → kimi-k2.7-code; on Ark → same
+#   xclaude --help                  # forwarded to claude
+#
+# If multiple keys are set, the first found wins (with a notice).
+# Set XCLAUDE_PREFER=dsclaude|... to force a specific provider.
+
+set -euo pipefail
+
+# Resolve symlink to find the real script directory.
+_SELF="$0"
+if [ -L "$_SELF" ]; then
+  _LINK="$(readlink "$_SELF")"
+  case "$_LINK" in
+    /*) _SELF="$_LINK" ;;
+    *)  _SELF="$(cd "$(dirname "$_SELF")" && pwd)/$_LINK" ;;
+  esac
+fi
+SELF_DIR="$(cd "$(dirname "$_SELF")" && pwd)"
+if [ -f "$SELF_DIR/lib/common.sh" ]; then source "$SELF_DIR/lib/common.sh"
+elif [ -f "$SELF_DIR/../lib/common.sh" ]; then source "$SELF_DIR/../lib/common.sh"
+else echo "xclaude: cannot find lib/common.sh. Reinstall or cd to repo." >&2; exit 1; fi
+
+check_version "xclaude" "$@"
+
+# ---- Ensure claude is available (called before each exec path) ----------------
+_ensure_claude() {
+  if command -v claude >/dev/null 2>&1; then return 0; fi
+  echo "xclaude: 'claude' not found in PATH." >&2
+  echo "  Install Claude Code: npm install -g @anthropic-ai/claude-code" >&2
+  echo "  Docs: https://docs.anthropic.com/en/docs/claude-code/overview" >&2
+  exit 1
+}
+
+# ---- Resolve the repo directory (for finding launcher scripts) ---------------
+REPO="$(find_repo "XCLAUDE_HOME")"
+if [ -z "$REPO" ]; then
+  echo "xclaude: cannot find the xxclaude repo." >&2
+  echo "  Set XCLAUDE_HOME=/path/to/xxclaude  or  cd into the repo and run ./xclaude" >&2
+  exit 1
+fi
+
+# ---- Extract an API key from env or shell rc files --------------------------
+# Uses the shared extract_key_from_file which skips commented-out lines.
+get_key() {
+  local var="$1"
+  # 1) Env var.
+  if [ -n "${!var:-}" ]; then printf '%s' "${!var}"; return 0; fi
+  # 2) Shell rc files (via shared extract_key_from_file).
+  local f candidate
+  for f in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
+    candidate="$(extract_key_from_file "$f" "$var" || true)"
+    if [ -n "${candidate:-}" ]; then printf '%s' "$candidate"; return 0; fi
+  done
+  return 1
+}
+
+# ---- Provider registry (key_var → launcher_name, label) ---------------------
+# Order matters: first match wins when multiple keys are set.
+PROVIDERS=(
+  "DEEPSEEK_API_KEY:dsclaude:DeepSeek"
+  "MIMO_API_KEY:mmclaude:Xiaomi MiMo"
+  "DASHSCOPE_API_KEY:qwclaude:Bailian Qwen payg"
+  "DASHSCOPE_CP_API_KEY:qwclaude:Bailian Qwen CodingPlan"
+  "DASHSCOPE_TP_API_KEY:qwclaude:Bailian Qwen TokenPlan"
+  "GLM_API_KEY:glmclaude:ZhipuAI GLM"
+  "KIMI_API_KEY:kmclaude:Moonshot Kimi"
+  "ARK_API_KEY:arkclaude:Volcengine Ark"
+  "LONGCAT_API_KEY:lcclaude:Meituan LongCat"
+  "MINIMAX_API_KEY:mxclaude:MiniMax"
+  "HY_API_KEY:hyclaude:Tencent TokenHub"
+  "SF_API_KEY:sfclaude:SiliconFlow"
+)
+
+# ---- Subcommands: ls, menu -------------------------------------------------
+if [ $# -gt 0 ]; then
+  case "$1" in
+    ls|list)
+      printf "%-20s %-4s %-25s %s\n" "BACKEND" "KEY" "ENV_VAR" "LAUNCHER"
+      printf "%-20s %-4s %-25s %s\n" "-------" "---" "-------" "--------"
+      for entry in "${PROVIDERS[@]}"; do
+        IFS=":" read -r key_var launcher label <<< "$entry"
+        status="✗"
+        get_key "$key_var" >/dev/null 2>&1 && status="✓"
+        printf "%-20s %-4s %-25s %s\n" "$label" "$status" "$key_var" "$launcher"
+      done
+      echo ""
+      echo "Set any key above and run: xclaude"
+      exit 0
+      ;;
+    menu|pick)
+      echo "Select a backend (enter number):"
+      echo ""
+      i=1
+      choices=()
+      for entry in "${PROVIDERS[@]}"; do
+        IFS=":" read -r key_var launcher label <<< "$entry"
+        mark=" "; extra=""
+        if get_key "$key_var" >/dev/null 2>&1; then
+          mark="✓"; extra="  ← key set"
+        else
+          mark="✗"; extra="  (key not set)"
+        fi
+        printf "  %2d) [%s] %-30s%s\n" "$i" "$mark" "$label" "$extra"
+        choices+=("$launcher")
+        i=$((i+1))
+      done
+      echo ""
+      read -r -p "Choice [1-$((i-1))]: " choice
+      idx="${choice:-1}"
+      if [ "$idx" -ge 1 ] 2>/dev/null && [ "$idx" -lt "$i" ]; then
+        SELECTED="${choices[$((idx-1))]}"
+        LAUNCHER_PATH="$REPO/$SELECTED"
+        if [ -x "$LAUNCHER_PATH" ]; then
+          echo "xclaude: launching $SELECTED..."
+          shift
+          _ensure_claude
+          exec "$LAUNCHER_PATH" "$@"
+        else
+          echo "xclaude: launcher not found: $LAUNCHER_PATH" >&2; exit 1
+        fi
+      else
+        echo "xclaude: invalid choice." >&2; exit 1
+      fi
+      exit 0
+      ;;
+    help|--help|-h)
+      echo "xclaude — auto-detect API key and launch the right backend."
+      echo ""
+      echo "Usage:"
+      echo "  xclaude [args]              Auto-detect and launch"
+      echo "  xclaude ls                  List all backends and key status"
+      echo "  xclaude menu                Interactive backend picker"
+      echo "  xclaude <launcher_args>     All args forwarded to launcher"
+      echo "                              (fast, long, effort, model aliases...)"
+      echo ""
+      echo "Env:"
+      echo "  XCLAUDE_PREFER=<launcher>   Force a specific backend"
+      echo "  XCLAUDE_HOME=/path/to/repo  Repo location override"
+      exit 0
+      ;;
+  esac
+fi
+
+# ---- Override via XCLAUDE_PREFER -------------------------------------------
+if [ -n "${XCLAUDE_PREFER:-}" ]; then
+  FOUND=""
+  for entry in "${PROVIDERS[@]}"; do
+    IFS=":" read -r key_var launcher label <<< "$entry"
+    if [ "$launcher" = "$XCLAUDE_PREFER" ]; then
+      key="$(get_key "$key_var" || true)"
+      if [ -n "${key:-}" ]; then FOUND="$launcher:$key:$label"; break; fi
+    fi
+  done
+  if [ -z "$FOUND" ]; then
+    echo "xclaude: XCLAUDE_PREFER=$XCLAUDE_PREFER but that key is not set. Trying auto-detect..." >&2
+  fi
+fi
+
+# ---- Auto-detect -----------------------------------------------------------
+if [ -z "${FOUND:-}" ]; then
+  FOUND=""
+  for entry in "${PROVIDERS[@]}"; do
+    IFS=":" read -r key_var launcher label <<< "$entry"
+    key="$(get_key "$key_var" || true)"
+    if [ -n "${key:-}" ]; then
+      if [ -z "$FOUND" ]; then
+        FOUND="$launcher:$key:$label"
+      else
+        # Multiple keys detected — warn but stick with the first.
+        echo "xclaude: multiple API keys detected. Using first found ($label)." >&2
+        echo "  Set XCLAUDE_PREFER=<launcher> to choose a specific provider." >&2
+        break
+      fi
+    fi
+  done
+fi
+
+if [ -z "${FOUND:-}" ]; then
+  echo "❌ xclaude: no known API key found." >&2
+  echo "   Set one of these in your ~/.zshrc or environment:" >&2
+  echo "     export DEEPSEEK_API_KEY=sk-...     # DeepSeek" >&2
+  echo "     export GLM_API_KEY=...              # ZhipuAI GLM" >&2
+  echo "     export KIMI_API_KEY=sk-...          # Moonshot Kimi" >&2
+  echo "     export DASHSCOPE_API_KEY=sk-...     # Bailian Qwen" >&2
+  echo "     export ARK_API_KEY=...              # Volcengine Ark" >&2
+  echo "     export LONGCAT_API_KEY=lc-...       # Meituan LongCat" >&2
+  echo "     export MINIMAX_API_KEY=...          # MiniMax" >&2
+  echo "     export HY_API_KEY=...               # Tencent TokenHub" >&2
+  echo "     export SF_API_KEY=sk-...            # SiliconFlow" >&2
+  echo "     export MIMO_API_KEY=sk-...          # Xiaomi MiMo" >&2
+  echo "   Or use a specific launcher directly: dsclaude, mmclaude, qwclaude, ..." >&2
+  exit 1
+fi
+
+IFS=":" read -r LAUNCHER _ VALID_LABEL <<< "$FOUND"
+LAUNCHER_PATH="$REPO/$LAUNCHER"
+
+if [ ! -x "$LAUNCHER_PATH" ]; then
+  echo "xclaude: launcher not found or not executable at $LAUNCHER_PATH" >&2
+  exit 1
+fi
+
+# Forward ALL remaining args to the underlying launcher.
+# The launcher will handle its own arg parsing (fast, long, effort, model aliases, etc.).
+echo "xclaude: detected $VALID_LABEL  →  delegating to $LAUNCHER"
+_ensure_claude
+exec "$LAUNCHER_PATH" "$@"

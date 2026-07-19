@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# analyze-image — describe an image via Qwen3.6-Flash for text-only models.
+# Usage: analyze-image <path-or-url> [focus prompt]
+#   <path-or-url> is either a local file path or an http(s) URL.
+# Requires: DASHSCOPE_API_KEY in env or shell rc. Returns plaintext on stdout.
+#
+# For inline-attached / pasted / clipboard images in Cowork or Claude Desktop,
+# use dsvision-mcp instead — it auto-finds Claude Code's image-cache and
+# bypasses Cowork's egress sandbox.
+
+set -euo pipefail
+
+INPUT="${1:-}"
+PROMPT="${2:-Describe this image in detail. Focus on text content, UI elements, code snippets, charts, error messages — anything a coding/agent task might care about.}"
+
+[[ -n "$INPUT" ]] || { echo "analyze-image: missing image path or URL" >&2; exit 1; }
+
+# Resolve DASHSCOPE_API_KEY: env first, then shell rc files. Claude Code's
+# subprocesses don't always inherit interactive-shell exports, so we look in
+# the rc files directly as a fallback.
+if [[ -z "${DASHSCOPE_API_KEY:-}" ]]; then
+  for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
+    [[ -r "$rc" ]] || continue
+    found=$(grep -v '^[[:space:]]*#' "$rc" 2>/dev/null \
+      | grep -E '^[[:space:]]*export[[:space:]]+DASHSCOPE_API_KEY=' \
+      | tail -1 \
+      | sed -E 's/^[^=]*=//; s/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/' \
+      || true)
+    [[ -n "$found" ]] && { export DASHSCOPE_API_KEY="$found"; break; }
+  done
+fi
+[[ -n "${DASHSCOPE_API_KEY:-}" ]] || {
+  echo "analyze-image: DASHSCOPE_API_KEY not set in env or shell rc files (~/.zshrc, ~/.bashrc, ...). Add 'export DASHSCOPE_API_KEY=sk-...' and retry." >&2
+  exit 1
+}
+
+# URL input → pass through directly (DashScope accepts public http/https URLs).
+if [[ "$INPUT" =~ ^https?:// ]]; then
+  IMAGE_URL="$INPUT"
+else
+  [[ -f "$INPUT" ]] || { echo "analyze-image: image not found: $INPUT" >&2; exit 1; }
+
+  # DashScope rejects payloads beyond ~10MB; fail early with a clear message.
+  SIZE=$(wc -c < "$INPUT" | tr -d ' ')
+  if (( SIZE > 10485760 )); then
+    echo "analyze-image: image too large ($SIZE bytes; limit 10485760). Resize and retry." >&2
+    exit 1
+  fi
+
+  case "$(echo "${INPUT##*.}" | tr 'A-Z' 'a-z')" in
+    jpg|jpeg) MIME=image/jpeg ;;
+    png)      MIME=image/png  ;;
+    webp)     MIME=image/webp ;;
+    gif)      MIME=image/gif  ;;
+    *)        MIME=$(file --mime-type -b "$INPUT") ;;
+  esac
+
+  B64=$(base64 < "$INPUT" | tr -d '\n')
+  IMAGE_URL="data:$MIME;base64,$B64"
+fi
+
+PAYLOAD=$(jq -n \
+  --arg model  "${DSVISION_MODEL:-qwen3.6-flash}" \
+  --arg url    "$IMAGE_URL" \
+  --arg prompt "$PROMPT" \
+  '{
+    model: $model,
+    messages: [{
+      role: "user",
+      content: [
+        { type: "image_url", image_url: { url: $url } },
+        { type: "text", text: $prompt }
+      ]
+    }]
+  }')
+
+BASE_URL="${DSVISION_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
+
+RESP=$(curl -sS -X POST "$BASE_URL/chat/completions" \
+  --connect-timeout 10 \
+  --max-time 60 \
+  -H "Authorization: Bearer $DASHSCOPE_API_KEY" \
+  -H "Content-Type: application/json" \
+  --data-raw "$PAYLOAD")
+
+if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
+  echo "analyze-image: API error" >&2
+  echo "$RESP" | jq '.error' >&2
+  exit 1
+fi
+
+CONTENT=$(echo "$RESP" | jq -r '.choices[0].message.content // empty')
+
+if [[ -z "$CONTENT" ]]; then
+  echo "analyze-image: empty response from model" >&2
+  echo "$RESP" | jq '.' >&2
+  exit 1
+fi
+
+echo "$CONTENT"

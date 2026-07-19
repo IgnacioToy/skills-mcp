@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""dsvision-mcp — MCP server exposing Qwen3.6-Flash vision to Claude Desktop / Cowork.
+
+Why this exists alongside skills/deepseek-vision/:
+- The skill (bash) runs INSIDE Cowork's Linux VM, behind egressAllowedDomains
+  (only *.anthropic.com / claude.com allowed). It can't reach DashScope.
+- This MCP server runs OUTSIDE the sandbox as a Claude Desktop child process,
+  bypasses the egress filter entirely, AND can read ~/.claude/image-cache/
+  on the host filesystem to grab the latest pasted/attached image.
+
+Tool: analyze_image(image_path: str = "", focus: str = "")
+- image_path empty → most-recent file in ~/.claude/image-cache/ (Claude Code's
+  auto-cache for inline-attached and pasted images).
+- image_path set → read that file.
+
+Install:
+    pip install fastmcp requests           # both ship with most envs
+
+Configure ~/Library/Application Support/Claude-3p/claude_desktop_config.json
+(and/or ~/Library/Application Support/Claude/claude_desktop_config.json):
+
+    {
+      "mcpServers": {
+        "dsvision": {
+          "command": "/Users/<you>/github/dsclaude/dsvision-mcp"
+        }
+      }
+    }
+
+Then restart Claude Desktop. Requires DASHSCOPE_API_KEY in env or shell rc.
+"""
+from __future__ import annotations
+
+import base64
+import datetime
+import os
+from pathlib import Path
+
+import requests
+from fastmcp import FastMCP
+
+mcp = FastMCP("dsvision")
+
+DASHSCOPE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+DEFAULT_MODEL = os.environ.get("DSVISION_MODEL", "qwen3.6-flash")
+IMAGE_CACHE = Path.home() / ".claude" / "image-cache"
+SIZE_CAP = 10 * 1024 * 1024  # 10 MB; DashScope rejects beyond this
+
+
+def resolve_api_key() -> str:
+    """env → ~/.zshrc → ~/.bashrc → ~/.bash_profile → ~/.profile.
+
+    Claude Desktop spawns this server as a child process; depending on how
+    Claude Desktop was launched, env may or may not include the user's shell
+    rc exports. Mirror dsclaude-desktop's resolve_api_key bash helper.
+    """
+    if (k := os.environ.get("DASHSCOPE_API_KEY")):
+        return k
+    for rc in (".zshrc", ".bashrc", ".bash_profile", ".profile"):
+        path = Path.home() / rc
+        if not path.exists():
+            continue
+        for line in path.read_text(errors="ignore").splitlines():
+            line = line.strip()
+            if line.startswith("#"):
+                continue
+            if line.startswith("export DASHSCOPE_API_KEY="):
+                value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                # Strip inline comment if present (e.g. "sk-abc # my key")
+                if " #" in value:
+                    value = value.split(" #", 1)[0].strip()
+                if value:
+                    return value
+    raise RuntimeError(
+        "DASHSCOPE_API_KEY not set in env or shell rc. "
+        "Add 'export DASHSCOPE_API_KEY=sk-...' to ~/.zshrc and restart Claude Desktop."
+    )
+
+
+def list_recent_cached_images(limit: int = 10) -> list[Path]:
+    """All images in ~/.claude/image-cache/<session-uuid>/N.png, sorted by mtime desc."""
+    if not IMAGE_CACHE.exists():
+        return []
+    images: list[Path] = []
+    for ext in ("*.png", "*.jpg", "*.jpeg", "*.webp", "*.heic", "*.gif"):
+        images.extend(IMAGE_CACHE.rglob(ext))
+    images.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return images[:limit]
+
+
+def _fmt_time(ts: float) -> str:
+    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def encode_image(path: Path) -> str:
+    """Return a data: URL for the local image."""
+    mime = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".webp": "image/webp", ".gif": "image/gif", ".heic": "image/heic",
+    }.get(path.suffix.lower(), "image/png")
+    b64 = base64.b64encode(path.read_bytes()).decode()
+    return f"data:{mime};base64,{b64}"
+
+
+@mcp.tool
+def analyze_image(
+    image_path: str = "",
+    focus: str = (
+        "Describe this image in detail. Focus on text content, UI elements, "
+        "code snippets, charts, error messages — anything a coding/agent task "
+        "might care about."
+    ),
+) -> str:
+    """Analyze an image with Qwen3.6-Flash and return a text description.
+
+    Args:
+        image_path: Local file path. Leave empty to auto-pick the most recent
+            image in ~/.claude/image-cache/ (where Claude Code caches every
+            attached or pasted image).
+        focus: Optional prompt to focus the description.
+
+    Raises:
+        ValueError: bad input (missing image, file too large, empty response).
+        RuntimeError: API key not found, network error, or DashScope HTTP error.
+    """
+    siblings: list[Path] = []
+    if not image_path:
+        recent = list_recent_cached_images()
+        if not recent:
+            raise ValueError(
+                "image_path empty and no images found in "
+                f"{IMAGE_CACHE}. Pass an explicit path."
+            )
+        path = recent[0]
+        # Cross-session race detector: if any other recent image's mtime is
+        # within 60s of the chosen one, surface them so the user can spot a
+        # wrong-image pick (e.g., two Claude Code sessions saving images at
+        # nearly the same moment).
+        chosen_mt = path.stat().st_mtime
+        siblings = [
+            p for p in recent[1:]
+            if abs(p.stat().st_mtime - chosen_mt) < 60
+        ]
+    else:
+        path = Path(image_path).expanduser().resolve()
+        if not path.is_file():
+            raise ValueError(f"image not found: {path}")
+
+    size = path.stat().st_size
+    if size > SIZE_CAP:
+        raise ValueError(f"image too large ({size} bytes; limit {SIZE_CAP})")
+
+    api_key = resolve_api_key()
+
+    try:
+        resp = requests.post(
+            DASHSCOPE_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": DEFAULT_MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": encode_image(path)}},
+                        {"type": "text", "text": focus},
+                    ],
+                }],
+            },
+            timeout=(10, 60),
+        )
+    except requests.RequestException as e:
+        raise RuntimeError(f"network failure calling DashScope: {e}")
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"DashScope HTTP {resp.status_code}: {resp.text[:500]}")
+
+    try:
+        content = resp.json()["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, ValueError) as e:
+        raise RuntimeError(f"unexpected DashScope response: {e}; raw: {resp.text[:500]}")
+
+    if not content:
+        raise ValueError("empty response from model")
+
+    # Footer: which file was actually analyzed (path + size + mtime), so the
+    # caller can verify the right image was processed when the description
+    # looks suspicious.
+    st = path.stat()
+    footer = f"\n\n[analyzed: {path} ({st.st_size:,} bytes, {_fmt_time(st.st_mtime)})]"
+    if siblings:
+        footer += "\n[other recent images in cache (within 60s of the chosen one):"
+        for s in siblings[:3]:
+            footer += f"\n  {s} ({_fmt_time(s.stat().st_mtime)})"
+        footer += "\n  if I picked the wrong one, call analyze_image again with image_path set explicitly]"
+    return content + footer
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "update":
+        import subprocess
+
+        repo = Path(__file__).resolve().parent
+        print(f"dsvision-mcp: pulling latest from {repo} ...")
+        try:
+            subprocess.run(["git", "-C", str(repo), "pull"], check=True)
+            print("dsvision-mcp: updated.")
+        except subprocess.CalledProcessError:
+            print(
+                "dsvision-mcp: git pull failed. Check network or resolve conflicts manually.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        sys.exit(0)
+
+    mcp.run()

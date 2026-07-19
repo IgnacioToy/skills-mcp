@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2034  # variables consumed by lib/common.sh
+# dsclaude — launch Claude Code on DeepSeek's Anthropic-compatible API.
+#
+# Follows the official guide:
+#   https://api-docs.deepseek.com/guides/anthropic_api
+#   https://api-docs.deepseek.com/guides/coding_agents
+#   https://api-docs.deepseek.com/quick_start/agent_integrations/claude_code
+#
+# Reads DEEPSEEK_API_KEY from the environment first, then falls back to
+# ~/.zshrc / ~/.bashrc / ~/.bash_profile / ~/.profile if not already exported.
+#
+# Quick start (no install needed):
+#   chmod +x dsclaude
+#   ./dsclaude
+#
+# Optional — make it globally available:
+#   sudo mv dsclaude /usr/local/bin/ && sudo chmod +x /usr/local/bin/dsclaude
+#
+# Use:
+#   dsclaude                  # start on deepseek-v4-pro  (default, full reasoning)
+#   dsclaude fast             # start on deepseek-v4-flash[1m] (cheaper / faster)
+#   dsclaude long             # request a 1M context window (DeepSeek V4 long-context)
+#   dsclaude long fast        # 1M + flash
+#   dsclaude effort max       # set reasoning effort (low|medium|high|xhigh|max)
+#   dsclaude update           # git pull latest from the dsclaude repo
+#   dsclaude --help           # any remaining flag is forwarded to claude
+#
+# Backward-compat aliases (kept for older muscle memory — v4-pro is unified
+# thinking/non-thinking, so these all resolve to deepseek-v4-pro today):
+#   think | reasoner | -r     # same as default
+#
+# Optional env overrides (take precedence over the positional aliases):
+#   DSCLAUDE_CTX=1048576      # set CLAUDE_CODE_MAX_CONTEXT_TOKENS and DISABLE_COMPACT=1
+#   DSCLAUDE_OUTPUT=8000      # cap output tokens via CLAUDE_CODE_MAX_OUTPUT_TOKENS
+#   DSCLAUDE_EFFORT=max       # CLAUDE_CODE_EFFORT_LEVEL (default: max, per DeepSeek docs)
+#
+# In-session switch:
+#   /model deepseek-v4-flash[1m]  # switch to the fast/haiku tier
+#   /model deepseek-v4-pro[1m]    # switch back to pro
+#
+set -euo pipefail
+
+# Resolve symlink to find the real script directory.
+_SELF="$0"
+if [ -L "$_SELF" ]; then
+  _LINK="$(readlink "$_SELF")"
+  case "$_LINK" in
+    /*) _SELF="$_LINK" ;;
+    *)  _SELF="$(cd "$(dirname "$_SELF")" && pwd)/$_LINK" ;;
+  esac
+fi
+SELF_DIR="$(cd "$(dirname "$_SELF")" && pwd)"
+if [ -f "$SELF_DIR/lib/common.sh" ]; then source "$SELF_DIR/lib/common.sh"
+elif [ -f "$SELF_DIR/../lib/common.sh" ]; then source "$SELF_DIR/../lib/common.sh"
+else echo "dsclaude: cannot find lib/common.sh. Reinstall or cd to repo." >&2; exit 1; fi
+
+check_version "dsclaude" "$@"
+
+# DeepSeek V4 model names (per DeepSeek docs, 2026-04).
+PRO_MODEL="deepseek-v4-pro[1m]"
+FLASH_MODEL="deepseek-v4-flash[1m]"
+
+# Handle the update subcommand before the API-key check so it works key-less.
+if [ $# -gt 0 ] && [ "$1" = "update" ]; then
+  do_update "dsclaude" "DSCLAUDE_HOME"
+fi
+
+API_KEY="$(resolve_api_key "DEEPSEEK_API_KEY")"
+if [ -z "$API_KEY" ]; then
+  echo "❌ DEEPSEEK_API_KEY not found." >&2
+  echo "   Add one line to ~/.zshrc or ~/.bashrc:" >&2
+  echo "     export DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxxxx" >&2
+  exit 1
+fi
+
+BASE_URL="https://api.deepseek.com/anthropic"
+
+# Positional aliases: `long` (1M context), `effort` (reasoning level), `fast` (flash as main).
+LONG_CTX=0
+EFFORT="${DSCLAUDE_EFFORT:-}"
+MAIN_MODEL="$PRO_MODEL"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    long)
+      LONG_CTX=1
+      shift
+      ;;
+    effort)
+      case "${2:-}" in
+        low|medium|high|xhigh|max) EFFORT="$2"; shift 2 ;;
+        *) echo "dsclaude: invalid effort level '${2:-}'. Use: low medium high xhigh max" >&2; exit 1 ;;
+      esac
+      ;;
+    fast|flash)
+      MAIN_MODEL="$FLASH_MODEL"
+      shift
+      ;;
+    think|reasoner|-r)
+      # Backward compat — v4-pro handles both thinking and non-thinking.
+      MAIN_MODEL="$PRO_MODEL"
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+# Pick the "other" model to surface in Claude Code's /model picker so you can
+# switch mid-session without restarting.
+if [ "$MAIN_MODEL" = "$PRO_MODEL" ]; then
+  OTHER_MODEL="$FLASH_MODEL"
+  OTHER_DESC="DeepSeek V4 Flash — fast / cheap haiku tier"
+else
+  OTHER_MODEL="$PRO_MODEL"
+  OTHER_DESC="DeepSeek V4 Pro — full reasoning"
+fi
+
+export_anthropic_base
+
+# DeepSeek-specific env vars (per official docs).
+export API_TIMEOUT_MS="600000"
+# Subagents: strip the [1m] long-context tag — short subagent calls don't need 1M.
+export CLAUDE_CODE_SUBAGENT_MODEL="${FLASH_MODEL%'[1m]'}"
+export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
+# DeepSeek docs recommend effort=max for coding agents.
+export CLAUDE_CODE_EFFORT_LEVEL="${EFFORT:-max}"
+
+set_custom_model "$OTHER_MODEL" "$MAIN_MODEL" "$OTHER_DESC"
+
+# Optional context-window override. Env > positional > unset (Claude Code default).
+# DeepSeek V4 Pro supports up to 1,048,576 input tokens.
+CTX="${DSCLAUDE_CTX:-}"
+if [ -z "$CTX" ] && [ "$LONG_CTX" = "1" ]; then
+  CTX="1048576"
+fi
+OUTPUT_CAP="${DSCLAUDE_OUTPUT:-}"
+
+# Apply context & output (skip apply_context_and_effort because effort is already
+# set above with DeepSeek-specific default).
+if [ -n "$CTX" ]; then
+  export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CTX"
+  export DISABLE_COMPACT=1
+fi
+if [ -n "$OUTPUT_CAP" ]; then
+  export CLAUDE_CODE_MAX_OUTPUT_TOKENS="$OUTPUT_CAP"
+fi
+
+banner="🚀 Claude Code on DeepSeek  →  $MAIN_MODEL"
+[ -n "$CTX" ] && banner="$banner  |  ctx=$CTX"
+[ -n "$EFFORT" ] && banner="$banner  |  effort=$EFFORT"
+echo "$banner  (switch mid-session via /model)"
+exec claude "$@"

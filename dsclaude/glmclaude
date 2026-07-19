@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2034  # variables consumed by lib/common.sh
+# glmclaude — launch Claude Code on ZhipuAI GLM's Anthropic-compatible API.
+#
+# Uses the official ZhipuAI Anthropic-compatible endpoint:
+#   - China (default): https://open.bigmodel.cn/api/anthropic
+#   - International:   https://api.z.ai/api/anthropic          (set GLM_BASE_URL)
+#
+# Reads GLM_API_KEY from the environment first, then falls back to
+# ~/.zshrc / ~/.bashrc / ~/.bash_profile / ~/.profile if not already exported.
+#
+# Quick start (no install needed):
+#   chmod +x glmclaude
+#   ./glmclaude
+#
+# Optional — make it globally available:
+#   sudo mv glmclaude /usr/local/bin/ && sudo chmod +x /usr/local/bin/glmclaude
+#
+# Use:
+#   glmclaude                  # start on glm-5.2 (ZhipuAI default)
+#   glmclaude fast             # start on glm-4.7 (cheaper / faster tier)
+#   glmclaude long             # request max context window
+#   glmclaude effort max       # set reasoning effort (low|medium|high|xhigh|max)
+#   glmclaude update           # git pull latest from this repo
+#   glmclaude --help           # any remaining flag is forwarded to claude
+#
+# Optional env overrides:
+#   GLM_MODEL=glm-5.2                        # main model
+#   GLM_FLASH_MODEL=glm-4.7                  # flash / haiku / subagent tier
+#   GLM_BASE_URL=https://api.z.ai/api/anthropic  # custom base URL (e.g. intl)
+#   GLM_CTX=1048576                          # max context tokens (defaults to 1M with `long`)
+#   GLM_OUTPUT=8000                          # cap output tokens
+#   GLM_EFFORT=max                           # CLAUDE_CODE_EFFORT_LEVEL
+#
+# In-session switch:
+#   /model glm-4.7        # switch to the flash tier
+#   /model glm-5.2        # switch back to pro
+#
+set -euo pipefail
+
+# Resolve symlink to find the real script directory.
+_SELF="$0"
+if [ -L "$_SELF" ]; then
+  _LINK="$(readlink "$_SELF")"
+  case "$_LINK" in
+    /*) _SELF="$_LINK" ;;
+    *)  _SELF="$(cd "$(dirname "$_SELF")" && pwd)/$_LINK" ;;
+  esac
+fi
+SELF_DIR="$(cd "$(dirname "$_SELF")" && pwd)"
+if [ -f "$SELF_DIR/lib/common.sh" ]; then source "$SELF_DIR/lib/common.sh"
+elif [ -f "$SELF_DIR/../lib/common.sh" ]; then source "$SELF_DIR/../lib/common.sh"
+else echo "glmclaude: cannot find lib/common.sh. Reinstall or cd to repo." >&2; exit 1; fi
+
+check_version "glmclaude" "$@"
+
+PRO_MODEL="${GLM_MODEL:-glm-5.2}"
+FLASH_MODEL="${GLM_FLASH_MODEL:-glm-4.7}"
+
+# Handle the update subcommand before the API-key check so it works key-less.
+if [ $# -gt 0 ] && [ "$1" = "update" ]; then
+  do_update "glmclaude" "GLMCLAUDE_HOME"
+fi
+
+API_KEY="$(resolve_api_key "GLM_API_KEY")"
+if [ -z "$API_KEY" ]; then
+  echo "❌ GLM_API_KEY not found." >&2
+  echo "   Add one line to ~/.zshrc or ~/.bashrc:" >&2
+  echo "     export GLM_API_KEY=your_zhipu_api_key" >&2
+  echo "   Get your key at: https://open.bigmodel.cn/usercenter/apikeys" >&2
+  exit 1
+fi
+
+BASE_URL="${GLM_BASE_URL:-https://open.bigmodel.cn/api/anthropic}"
+
+LONG_CTX=0
+EFFORT="${GLM_EFFORT:-}"
+
+# Positional alias: `fast`/`flash` runs the flash tier as the main model.
+MAIN_MODEL="$PRO_MODEL"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    fast|flash) MAIN_MODEL="$FLASH_MODEL"; shift ;;
+    long) LONG_CTX=1; shift ;;
+    effort)
+      case "${2:-}" in
+        low|medium|high|xhigh|max) EFFORT="$2"; shift 2 ;;
+        *) echo "glmclaude: invalid effort level '${2:-}'. Use: low medium high xhigh max" >&2; exit 1 ;;
+      esac
+      ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+
+# Surface the other model in Claude Code's /model picker for mid-session switching.
+if [ "$MAIN_MODEL" = "$PRO_MODEL" ]; then
+  OTHER_MODEL="$FLASH_MODEL"
+  OTHER_DESC="GLM 4.7 — fast / cheap tier"
+else
+  OTHER_MODEL="$PRO_MODEL"
+  OTHER_DESC="GLM 5.2 — full reasoning"
+fi
+
+export_anthropic_base
+# Subagents run on the cheaper flash tier.
+export CLAUDE_CODE_SUBAGENT_MODEL="$FLASH_MODEL"
+set_custom_model "$OTHER_MODEL" "$MAIN_MODEL" "$OTHER_DESC"
+
+CTX="${GLM_CTX:-}"
+OUTPUT_CAP="${GLM_OUTPUT:-}"
+apply_context_and_effort
+
+show_banner_and_launch "GLM" "$@"

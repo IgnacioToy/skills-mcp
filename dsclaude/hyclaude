@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2034  # variables consumed by lib/common.sh
+# hyclaude — launch Claude Code on Tencent TokenHub's Anthropic-compatible API.
+#
+# Tencent TokenHub is a multi-model aggregator — one subscription gives access
+# to Hunyuan (HY3), DeepSeek, GLM, Kimi, MiniMax, Qwen, and more.
+#
+# Endpoint:
+#   - Token Plan (recommended): https://api.lkeap.cloud.tencent.com/plan/anthropic
+#   - Coding Plan:              https://api.lkeap.cloud.tencent.com/coding/anthropic
+#
+# Reads HY_API_KEY from the environment first, then falls back to
+# ~/.zshrc / ~/.bashrc / ~/.bash_profile / ~/.profile if not already exported.
+#
+# Quick start (no install needed):
+#   chmod +x hyclaude
+#   ./hyclaude
+#
+# Optional — make it globally available:
+#   sudo mv hyclaude /usr/local/bin/ && sudo chmod +x /usr/local/bin/hyclaude
+#
+# Use:
+#   hyclaude                  # hy3-preview (Tencent default)
+#   hyclaude fast             # hy-mt2-lite (cheap / fast)
+#   hyclaude deepseek         # deepseek-v4-pro
+#   hyclaude kimi             # kimi-k2.7-code
+#   hyclaude glm              # glm-5.2
+#   hyclaude minimax          # minimax-m3
+#   hyclaude qwen             # qwen3.5-plus
+#   hyclaude long             # request max context window
+#   hyclaude effort max       # set reasoning effort (low|medium|high|xhigh|max)
+#   hyclaude update           # git pull latest from this repo
+#   hyclaude --help           # any remaining flag is forwarded to claude
+#
+# Optional env overrides:
+#   HY_MODEL=hy3-preview                      # main model (any model on TokenHub)
+#   HY_FLASH_MODEL=hy-mt2-lite                # flash / haiku / subagent tier
+#   HY_BASE_URL=https://.../anthropic          # custom Anthropic-compatible base URL
+#   HY_CTX=1048576                            # max context tokens
+#   HY_OUTPUT=8000                            # cap output tokens
+#   HY_EFFORT=max                             # CLAUDE_CODE_EFFORT_LEVEL
+#
+# Get your API key: https://cloud.tencent.com/product/lkeap
+
+set -euo pipefail
+
+# Resolve symlink to find the real script directory.
+_SELF="$0"
+if [ -L "$_SELF" ]; then
+  _LINK="$(readlink "$_SELF")"
+  case "$_LINK" in
+    /*) _SELF="$_LINK" ;;
+    *)  _SELF="$(cd "$(dirname "$_SELF")" && pwd)/$_LINK" ;;
+  esac
+fi
+SELF_DIR="$(cd "$(dirname "$_SELF")" && pwd)"
+if [ -f "$SELF_DIR/lib/common.sh" ]; then source "$SELF_DIR/lib/common.sh"
+elif [ -f "$SELF_DIR/../lib/common.sh" ]; then source "$SELF_DIR/../lib/common.sh"
+else echo "hyclaude: cannot find lib/common.sh. Reinstall or cd to repo." >&2; exit 1; fi
+
+check_version "hyclaude" "$@"
+
+PRO_MODEL="${HY_MODEL:-hy3-preview}"
+FLASH_MODEL="${HY_FLASH_MODEL:-hy-mt2-lite}"
+
+if [ $# -gt 0 ] && [ "$1" = "update" ]; then
+  do_update "hyclaude" "HYCLAUDE_HOME"
+fi
+
+API_KEY="$(resolve_api_key "HY_API_KEY")"
+if [ -z "$API_KEY" ]; then
+  echo "❌ HY_API_KEY not found." >&2
+  echo "   Add one line to ~/.zshrc or ~/.bashrc:  export HY_API_KEY=your_api_key" >&2
+  echo "   Get your key at: https://cloud.tencent.com/product/lkeap" >&2
+  exit 1
+fi
+
+BASE_URL="${HY_BASE_URL:-https://api.lkeap.cloud.tencent.com/plan/anthropic}"
+
+LONG_CTX=0
+EFFORT="${HY_EFFORT:-}"
+
+MAIN_MODEL=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    # Tier aliases
+    max|pro|code)   MAIN_MODEL="$PRO_MODEL"; shift ;;
+    fast|flash|lite) MAIN_MODEL="$FLASH_MODEL"; shift ;;
+    # Provider aliases
+    kimi)           MAIN_MODEL="kimi-k2.7-code"; shift ;;
+    kimi-pro|kimi-k2) MAIN_MODEL="kimi-k2.6"; shift ;;
+    deepseek)       MAIN_MODEL="deepseek-v4-pro"; shift ;;
+    deepseek-flash) MAIN_MODEL="deepseek-v4-flash"; shift ;;
+    glm)            MAIN_MODEL="glm-5.2"; shift ;;
+    minimax)        MAIN_MODEL="minimax-m3"; shift ;;
+    qwen)           MAIN_MODEL="qwen3.5-plus"; shift ;;
+    # Context & effort
+    long) LONG_CTX=1; shift ;;
+    effort)
+      case "${2:-}" in
+        low|medium|high|xhigh|max) EFFORT="$2"; shift 2 ;;
+        *) echo "hyclaude: invalid effort level '${2:-}'. Use: low medium high xhigh max" >&2; exit 1 ;;
+      esac
+      ;;
+    --) shift; break ;;
+    *)  break ;;
+  esac
+done
+
+if [ -z "$MAIN_MODEL" ]; then MAIN_MODEL="$PRO_MODEL"; fi
+
+# Pick a smart alternate for the /model picker.
+case "$MAIN_MODEL" in
+  "$PRO_MODEL")       OTHER_MODEL="$FLASH_MODEL"; OTHER_DESC="HY MT2 Lite — fast / cheap tier" ;;
+  "$FLASH_MODEL")     OTHER_MODEL="$PRO_MODEL";   OTHER_DESC="HY3 Preview — Tencent flagship" ;;
+  kimi-k2.7-code)     OTHER_MODEL="kimi-k2.6";    OTHER_DESC="Kimi K2.6 — full reasoning" ;;
+  kimi-k2.6)          OTHER_MODEL="kimi-k2.7-code"; OTHER_DESC="Kimi K2.7 Code — code specialist" ;;
+  deepseek-v4-pro)    OTHER_MODEL="deepseek-v4-flash"; OTHER_DESC="DeepSeek V4 Flash" ;;
+  deepseek-v4-flash)  OTHER_MODEL="deepseek-v4-pro";   OTHER_DESC="DeepSeek V4 Pro" ;;
+  *)                  OTHER_MODEL="$PRO_MODEL";   OTHER_DESC="HY3 Preview — Tencent flagship" ;;
+esac
+
+export_anthropic_base
+export CLAUDE_CODE_SUBAGENT_MODEL="$FLASH_MODEL"
+set_custom_model "$OTHER_MODEL" "$MAIN_MODEL" "$OTHER_DESC"
+
+CTX="${HY_CTX:-}"
+OUTPUT_CAP="${HY_OUTPUT:-}"
+apply_context_and_effort
+
+show_banner_and_launch "TokenHub" "$@"
